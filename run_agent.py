@@ -143,7 +143,7 @@ def run(
     print(f"[*] Model:     {model_name}")
     print(f"[*] Bug:       {meta['problem_statement'][:80]}...")
 
-    # Spin up the container from Rishi's pre-built image
+   
     env = DockerEnvironment(
         image=meta["docker_image"],
         cwd="/testbed",                  # all Zephyr source lives here
