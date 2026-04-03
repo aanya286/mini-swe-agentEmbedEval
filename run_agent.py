@@ -6,11 +6,15 @@ an LLM's ability to fix an embedded systems PR inside a Zephyr/QEMU container.
 
 Usage:
     python run_agent.py \
-        --image ghcr.io/yourproject/zephyr-embedbench:latest \
-        --model claude-sonnet-4-20250514 \
-        --diff path/to/pr.diff \
-        --spec "Fix the off-by-one error in the ring buffer implementation" \
-        --test-cmd "west build -b native_posix && ./build/zephyr/zephyr.exe"
+        --instance zephyr__zephyr-65697 \
+        --model claude-sonnet-4-20250514
+
+Or with overrides:
+    python run_agent.py \
+        --instance zephyr__zephyr-65697 \
+        --model gpt-4o \
+        --step-limit 50 \
+        --output trajectories/zephyr-65697.json
 """
 
 import argparse
@@ -26,64 +30,127 @@ from minisweagent.environments.docker import DockerEnvironment
 # ── Prompt templates ──────────────────────────────────────────────────────────
 
 SYSTEM_TEMPLATE = """\
-You are an expert embedded systems engineer fixing bugs in Zephyr RTOS firmware.
-You have bash access to a Docker container with Zephyr, west, and QEMU installed.
+You are an expert embedded systems engineer. You can interact with a
+Linux shell to navigate codebases, edit source files, build firmware,
+and run tests. You are working inside a Zephyr RTOS repository.
 
-Your only tool is bash. To run a command, output it in a bash block:
-```bash
-<your command here>
-```
+Your response must contain exactly ONE bash code block with ONE command
+(or commands connected with && or ||). Include a THOUGHT section before
+your command explaining your reasoning.
 
-Rules:
-- Fix the issue described in the task.
-- Use the provided test command to verify your fix.
-- When tests pass, output EXACTLY this as your final command (returncode must be 0):
+<format_example>
+THOUGHT: Your reasoning here
 ```bash
-echo "COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT"
-echo "Fixed: <one line description of what you changed>"
+your_command_here
 ```
-- Do not modify test files.
-- Do not guess — read the code, understand the bug, then fix it.
+</format_example>
+
+## Zephyr Developer Guide
+
+**Build system**: Zephyr uses `west` + CMake + Ninja.
+- Build: `west build -b <board> <test_path>`
+- Run tests: `west build -t run` (runs on QEMU, must build first)
+- Clean rebuild: `rm -rf build && west build -b <board> <test_path>`
+- Incremental rebuild after editing a .c file: just run `west build` again (fast)
+
+**Directory structure**:
+- `kernel/` — Core kernel
+- `lib/posix/` — POSIX API implementation
+- `subsys/` — Subsystems
+- `drivers/` — Device drivers
+- `tests/` — Test suites
+- `include/` — Public headers
+
+**Test framework**: Zephyr uses `ztest`. Tests defined with `ZTEST(suite, test_name)`.
+Assertions: `zassert_ok()`, `zassert_equal()`, `zassert_true()`, etc.
+
+**Code navigation**:
+- `grep -rn "function_name" --include="*.c" --include="*.h" .`
+- `grep "function_name" tags` (ctags index pre-built at /testbed/tags)
+
+**When done**, submit with:
+```bash
+echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT
+```
 """
 
 INSTANCE_TEMPLATE = """\
-## Task
+<issue_description>
 {{ task }}
+</issue_description>
 
-## PR Diff (context — shows what was broken/changed)
-```diff
-{{ diff }}
-```
+<project_context>
+Project: Zephyr RTOS
+Repository is at: /testbed
+</project_context>
 
-## Test command to verify your fix
-```
-{{ test_cmd }}
-```
+<test_info>
+The following tests are currently FAILING and should pass after your fix:
+{{ fail_to_pass }}
 
-Start by exploring the relevant files, then implement your fix.
+Tests that must continue to pass:
+{{ pass_to_pass }}
+
+Build command: {{ build_command }}
+Run tests: {{ run_command }}
+Test directory: {{ test_path }}
+Target platform: {{ platform }}
+</test_info>
+
+<instructions>
+Fix the source code so the failing tests pass. Do NOT modify test files.
+
+Recommended workflow:
+1. Read the failing test code to understand what behavior is expected
+2. Use grep/ctags to find the relevant source code
+3. Understand the bug
+4. Edit the source code to fix it
+5. Rebuild and run tests to verify
+6. Submit: echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT
+</instructions>
 """
 
 
-# ── Entrypoint ────────────────────────────────────────────────────────────────
+# ── Runner ────────────────────────────────────────────────────────────────────
+
+def load_metadata(instance_id: str) -> dict:
+    """Load instance metadata.json from the standard location."""
+    meta_path = Path(f"docker/instances/{instance_id}/metadata.json")
+    if not meta_path.exists():
+        # fallback: look next to this script
+        meta_path = Path(__file__).parent / "metadata.json"
+    return json.loads(meta_path.read_text())
+
 
 def run(
-    image: str,
+    instance_id: str,
     model_name: str,
-    diff: str,
-    spec: str,
-    test_cmd: str,
-    workdir: str = "/workspace",
-    step_limit: int = 30,
-    cost_limit: float = 3.0,
+    step_limit: int = 100,
+    cost_limit: float = 5.0,
+    timeout: int = 180,
     output_path: str | None = None,
 ) -> dict:
     """
-    Run the agent on a single PR instance.
+    Run the agent on a single benchmark instance.
 
     Returns:
-        Dict with 'exit_status' and 'submission' keys from the agent.
+        Dict with 'exit_status' and 'submission' keys.
     """
-    env = DockerEnvironment(image=image, cwd=workdir)
+    meta = load_metadata(instance_id)
+
+    print(f"[*] Instance:  {instance_id}")
+    print(f"[*] Image:     {meta['docker_image']}")
+    print(f"[*] Model:     {model_name}")
+    print(f"[*] Bug:       {meta['problem_statement'][:80]}...")
+
+    # Spin up the container from Rishi's pre-built image
+    env = DockerEnvironment(
+        image=meta["docker_image"],
+        cwd="/testbed",                  # all Zephyr source lives here
+        timeout=timeout,                 # west build can take ~60-120s
+        forward_env=["ANTHROPIC_API_KEY", "OPENAI_API_KEY", "GEMINI_API_KEY"],
+    )
+
     model = LitellmModel(model_name=model_name)
 
     agent = DefaultAgent(
@@ -97,9 +164,13 @@ def run(
     )
 
     result = agent.run(
-        task=spec,
-        diff=diff,
-        test_cmd=test_cmd,
+        task=meta["problem_statement"],
+        platform=meta["platform"],
+        test_path=meta["test_path"],
+        build_command=meta["build_command"],
+        run_command=meta["run_command"],
+        fail_to_pass=", ".join(meta["fail_to_pass"]),
+        pass_to_pass=", ".join(meta["pass_to_pass"]),
     )
 
     return result
@@ -107,36 +178,24 @@ def run(
 
 def main():
     parser = argparse.ArgumentParser(description="Run EmbedBench mini-swe-agent evaluation")
-    parser.add_argument("--image", required=True, help="Docker image name (from Rishi)")
+    parser.add_argument("--instance", default="zephyr__zephyr-65697", help="Instance ID")
     parser.add_argument("--model", default="claude-sonnet-4-20250514", help="LiteLLM model string")
-    parser.add_argument("--diff", required=True, help="Path to PR diff file (or raw diff string)")
-    parser.add_argument("--spec", required=True, help="Natural language description of the issue to fix")
-    parser.add_argument("--test-cmd", required=True, help="Command to run inside container to verify fix")
-    parser.add_argument("--workdir", default="/workspace", help="Working directory inside container")
-    parser.add_argument("--step-limit", type=int, default=30, help="Max agent steps")
-    parser.add_argument("--cost-limit", type=float, default=3.0, help="Max USD cost")
+    parser.add_argument("--step-limit", type=int, default=100, help="Max agent steps")
+    parser.add_argument("--cost-limit", type=float, default=5.0, help="Max USD cost")
+    parser.add_argument("--timeout", type=int, default=180, help="Per-command timeout in seconds")
     parser.add_argument("--output", help="Save trajectory JSON to this path")
     args = parser.parse_args()
 
-    # Load diff from file if it's a path, otherwise treat as raw string
-    diff_path = Path(args.diff)
-    diff = diff_path.read_text() if diff_path.exists() else args.diff
-
     result = run(
-        image=args.image,
+        instance_id=args.instance,
         model_name=args.model,
-        diff=diff,
-        spec=args.spec,
-        test_cmd=args.test_cmd,
-        workdir=args.workdir,
         step_limit=args.step_limit,
         cost_limit=args.cost_limit,
+        timeout=args.timeout,
         output_path=args.output,
     )
 
     print(json.dumps(result, indent=2))
-
-    # Exit 0 if submitted (tests passed), 1 otherwise
     sys.exit(0 if result.get("exit_status") == "Submitted" else 1)
 
 
