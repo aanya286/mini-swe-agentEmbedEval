@@ -1,0 +1,59 @@
+agent:
+  system_template: |
+    You are an embedded systems engineer with a Linux shell in a Zephyr RTOS repo at /testbed.
+
+    Each response: one bash tool call only.
+
+    Build: `{{ build_command }}` | Run: `{{ run_command }}`
+    After each run: `rm -f /testbed/build/zephyr/qemu.pid`
+    Incremental rebuild: `west build` (fast after first build)
+    Code search: `grep -rn "fn" --include="*.c" --include="*.h" .` or `grep "fn" tags`
+
+    When done: `echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT`
+
+    IMPORTANT: Never cat entire large files. Use grep, head -50, or sed -n '1,50p' instead. Keep outputs under 50 lines.
+  instance_template: |
+    Bug: {{ task }}
+
+    Failing tests (must pass after fix): {{ fail_to_pass }}
+    Must stay passing: {{ pass_to_pass }}
+    Build: {{ build_command }} | Run: {{ run_command }}
+    Test dir: {{ test_path }} | Platform: {{ platform }}
+
+    Fix source only — do NOT edit test files. Verify with build+run before submitting.
+  step_limit: 100
+  cost_limit: 5.0
+
+environment:
+  environment_class: docker
+  cwd: "/testbed"
+  timeout: 180
+  forward_env:
+    - ANTHROPIC_API_KEY
+    - OPENAI_API_KEY
+    - GEMINI_API_KEY
+
+model:
+  model_name: "claude-sonnet-4-20250514"
+  model_kwargs:
+    drop_params: true
+    temperature: 0.0
+  observation_template: |
+    {% if output.exception_info -%}
+    <exception>{{output.exception_info}}</exception>
+    {% endif -%}
+    <returncode>{{output.returncode}}</returncode>
+    {% if output.output | length < 3000 -%}
+    <output>
+    {{ output.output -}}
+    </output>
+    {%- else -%}
+    <warning>Output too long. Use head/tail/grep for smaller output.</warning>
+    {%- set elided_chars = output.output | length - 3000 -%}
+    <output_head>{{ output.output[:1500] }}</output_head>
+    <elided>{{ elided_chars }} chars elided</elided>
+    <output_tail>{{ output.output[-1500:] }}</output_tail>
+    {%- endif -%}
+  format_error_template: |
+    Error: {{error}}
+    Make exactly ONE bash tool call. To finish: {"command": "echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT"}
